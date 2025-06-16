@@ -4,6 +4,10 @@ VGGT Model Loader
 """
 
 import os
+import sys
+sys.path.append(
+    os.path.dirname(os.path.abspath(__file__))
+)
 import logging
 from typing import Dict, Optional
 import torch

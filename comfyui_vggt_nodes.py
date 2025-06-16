@@ -1,4 +1,8 @@
 import os
+import sys
+sys.path.append(
+    os.path.dirname(os.path.abspath(__file__))
+)
 import json
 import tempfile
 from typing import List, Any, Dict
@@ -8,6 +12,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+import torch.nn.functional as F
 
 # 尝试导入 ComfyUI 的类型标记
 try:
@@ -355,6 +360,54 @@ def _create_insufficient_data_image():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0.5, 0.5, 0.5), 1)
     return torch.from_numpy(canvas).unsqueeze(0)
 
+def preprocess_tensor_like_vggt(imgs, mode="crop"):
+    """
+    imgs: [B, C, H, W] 或 [B, H, W, C]，像素值0~1
+    返回: [B, 3, H, W]，宽518，高为14的倍数
+    """
+    target_size = 518
+
+    # 如果是 [B, H, W, C]，转为 [B, C, H, W]
+    if imgs.shape[-1] == 3:
+        imgs = imgs.permute(0, 3, 1, 2).contiguous()
+
+    B, C, H, W = imgs.shape
+
+    # 计算新尺寸
+    if mode == "pad":
+        if W >= H:
+            new_W = target_size
+            new_H = round(H * (new_W / W) / 14) * 14
+        else:
+            new_H = target_size
+            new_W = round(W * (new_H / H) / 14) * 14
+    else:  # crop
+        new_W = target_size
+        new_H = round(H * (new_W / W) / 14) * 14
+
+    # resize
+    imgs = F.interpolate(imgs, size=(new_H, new_W), mode='bilinear', align_corners=False)
+
+    # crop模式下，如果高度大于518，中心裁剪
+    if mode == "crop" and new_H > target_size:
+        start_y = (new_H - target_size) // 2
+        imgs = imgs[:, :, start_y : start_y + target_size, :]
+
+    # pad模式下，pad到正方形
+    if mode == "pad":
+        h_padding = target_size - imgs.shape[2]
+        w_padding = target_size - imgs.shape[3]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            imgs = F.pad(
+                imgs, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+            )
+
+    return imgs
+
 # -----------------------------------------------------------------------------
 # 主要节点实现
 # -----------------------------------------------------------------------------
@@ -519,16 +572,127 @@ class VGGTVideoCameraNode:
             error_json = json.dumps({"success": False, "error": error_msg}, ensure_ascii=False, indent=2)
             return (error_json, empty_img, error_json)
 
+class VGGTSingleImageCameraNode:
+    """VGGT 单张图片相机参数估计节点"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vggt_model": ("VVL_VGGT_MODEL", {
+                    "tooltip": "来自VVLVGGTLoader的VGGT模型实例，包含已加载的模型和设备信息"
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "输入的单张图片，格式为[B,H,W,C]的tensor"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING")
+    RETURN_NAMES = ("intrinsics_json", "trajectory_preview", "poses_json")
+    FUNCTION = "estimate"
+    CATEGORY = "💃VVL/VGGT"
+
+    def estimate(self, vggt_model: Dict, image: torch.Tensor):
+        """执行相机参数估计"""
+        try:
+            # 检查VGGT工具函数是否可用
+            if not VGGT_UTILS_AVAILABLE:
+                raise RuntimeError(f"VGGT utils not available: {_VGGT_UTILS_IMPORT_ERROR}")
+            
+            # 从模型字典中获取信息
+            model_instance = vggt_model['model']
+            device = vggt_model['device']
+            model_name = vggt_model['model_name']
+            
+            logger.info(f"VGGTSingleImageCameraNode: Using {model_name} on {device}")
+            
+            # 确定数据类型
+            if device.type == "cuda":
+                try:
+                    # 尝试使用BFloat16，如果不支持则fallback到Float16
+                    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                except:
+                    dtype = torch.float16
+            else:
+                dtype = torch.float32
+
+            # 确保输入图像格式正确
+            if len(image.shape) != 4:
+                raise ValueError(f"输入图像维度错误，期望[B,H,W,C]，得到{image.shape}")
+            
+            # 将图像移动到正确的设备
+            imgs = image.to(device)
+            logger.info(f"VGGTSingleImageCameraNode: Input image shape: {imgs.shape}")
+
+            imgs = preprocess_tensor_like_vggt(imgs, mode="crop")  # 或 "pad"
+
+            # 模型推理
+            with torch.no_grad():
+                try:
+                    with torch.amp.autocast(device_type=device.type, dtype=dtype):
+                        predictions = model_instance(imgs)
+                except:
+                    # Fallback方案
+                    try:
+                        if device.type == "cuda":
+                            with torch.cuda.amp.autocast(dtype=dtype):
+                                predictions = model_instance(imgs)
+                        else:
+                            predictions = model_instance(imgs)
+                    except:
+                        # 最后的fallback
+                        predictions = model_instance(imgs)
+                
+                # 从predictions中提取pose_enc
+                pose_enc = predictions["pose_enc"]
+                logger.info(f"VGGTSingleImageCameraNode: pose_enc shape: {pose_enc.shape}")
+                        
+            # 转换为内外参矩阵
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, imgs.shape[-2:])
+            
+            # 去除批次维度
+            if len(extrinsic.shape) == 4:  # (1,N,3,4)
+                extrinsic = extrinsic[0]   # (N,3,4)
+            if len(intrinsic.shape) == 4:  # (1,N,3,3)
+                intrinsic = intrinsic[0]   # (N,3,3)
+                
+            extrinsic = extrinsic.cpu()
+            intrinsic = intrinsic.cpu()
+            
+            logger.info(f"VGGTSingleImageCameraNode: Final matrix shapes - "
+                      f"extrinsic: {extrinsic.shape}, intrinsic: {intrinsic.shape}")
+
+            # 生成JSON输出
+            intrinsics_json, poses_json = _matrices_to_json(intrinsic.numpy(), extrinsic.numpy())
+
+            # 生成轨迹预览图
+            traj_tensor = _create_traj_preview(extrinsic)
+
+            logger.info("VGGTSingleImageCameraNode: Camera estimation completed successfully")
+            return (intrinsics_json, traj_tensor, poses_json)
+
+        except Exception as e:
+            error_msg = f"VGGT估计错误: {str(e)}"
+            logger.error(error_msg)
+            
+            # 返回错误结果
+            empty_img = torch.ones((1, 400, 400, 3), dtype=torch.float32) * 0.1
+            error_json = json.dumps({"success": False, "error": error_msg}, ensure_ascii=False, indent=2)
+            return (error_json, empty_img, error_json)
+
 # -----------------------------------------------------------------------------
 # 节点注册
 # -----------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
     "VGGTVideoCameraNode": VGGTVideoCameraNode,
+    "VGGTSingleImageCameraNode": VGGTSingleImageCameraNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VGGTVideoCameraNode": "VVL VGGT Video Camera Estimator",
+    "VGGTSingleImageCameraNode": "VVL VGGT Single Image Camera Estimator",
 }
 
 # 如果模型加载器可用，添加到映射中
