@@ -681,6 +681,136 @@ class VGGTSingleImageCameraNode:
             error_json = json.dumps({"success": False, "error": error_msg}, ensure_ascii=False, indent=2)
             return (error_json, empty_img, error_json)
 
+class CalculateMaskCentersSimple3D:
+    """计算mask中心点的3D世界坐标"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "masks": ("MASK", {}),
+                "depth_image": ("IMAGE", {}),
+                "intrinsics_json": ("STRING", {}),
+                "poses_json": ("STRING", {}),
+            },
+            "optional": {
+                "view_id": ("INT", {
+                    "default": 0, "min": 0, "max": 100,
+                    "tooltip": "使用哪个视角的相机参数"
+                }),
+                "min_depth": ("FLOAT", {
+                    "default": 0.5, "min": 0.01, "max": 1000.0,
+                    "tooltip": "深度图的最小深度值（米）"
+                }),
+                "max_depth": ("FLOAT", {
+                    "default": 50.0, "min": 0.1, "max": 1000.0,
+                    "tooltip": "深度图的最大深度值（米）"
+                }),
+            }
+        }
+    
+    CATEGORY = "💃VVL/VGGT"
+    FUNCTION = "main"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("mask_centers_3d",)
+    
+    def calculate_depth(self, x_cord, y_cord, depth_npy):
+        """双线性插值计算深度值"""
+        if len(depth_npy.shape) > 2:
+            if depth_npy.shape[2] == 1:
+                depth_npy = depth_npy[:, :, 0]
+            else:
+                depth_npy = np.mean(depth_npy, axis=2)
+        
+        h, w = depth_npy.shape
+        x0, y0 = int(np.floor(x_cord)), int(np.floor(y_cord))
+        x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
+        
+        wx = x_cord - x0
+        wy = y_cord - y0
+        
+        top = depth_npy[y0, x0] * (1 - wx) + depth_npy[y0, x1] * wx
+        bottom = depth_npy[y1, x0] * (1 - wx) + depth_npy[y1, x1] * wx
+        
+        return float(top * (1 - wy) + bottom * wy)
+    
+    def main(self, masks, depth_image, intrinsics_json, poses_json, 
+             view_id=0, min_depth=0.5, max_depth=50.0): 
+        try:
+            # 解析相机参数
+            intrinsics_data = json.loads(intrinsics_json)
+            poses_data = json.loads(poses_json)
+            
+            # 获取指定视角的相机参数
+            intrinsic_matrix = None
+            extrinsic_matrix = None
+            
+            for camera in intrinsics_data["cameras"]:
+                if camera["view_id"] == view_id:
+                    intrinsic_matrix = np.array(camera["intrinsic_matrix"])
+                    break
+            
+            for pose in poses_data["poses"]:
+                if pose["view_id"] == view_id:
+                    extrinsic_matrix = np.array(pose["extrinsic_matrix"])
+                    break
+            
+            if intrinsic_matrix is None or extrinsic_matrix is None:
+                raise ValueError(f"找不到view_id={view_id}的相机参数")
+            
+            # 转换深度图为numpy数组
+            depth_np = depth_image[0].cpu().numpy()
+            
+            # 相机参数
+            fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+            cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+            R = extrinsic_matrix[:3, :3]
+            t = extrinsic_matrix[:3, 3]
+            R_inv = R.T
+            t_world = -R_inv @ t
+            
+            # 初始化结果列表
+            mask_centers_3d = []
+            
+            # 遍历每个mask
+            for i in range(masks.shape[0]):
+                mask = masks[i].cpu().numpy()
+                
+                # 找到mask中所有非零点的坐标
+                y_coords, x_coords = np.where(mask > 0)
+                
+                if len(y_coords) > 0:
+                    # 计算mask的中心点
+                    center_y = np.mean(y_coords)
+                    center_x = np.mean(x_coords)
+                    
+                    # 计算中心点的深度值
+                    center_depth_01 = self.calculate_depth(center_x, center_y, depth_np)
+                    depth_absolute = center_depth_01 * (max_depth - min_depth) + min_depth
+                    
+                    # 转换为3D世界坐标
+                    x_cam = (center_x - cx) * depth_absolute / fx
+                    y_cam = (center_y - cy) * depth_absolute / fy
+                    z_cam = depth_absolute
+                    
+                    cam_coords = np.array([x_cam, y_cam, z_cam])
+                    world_coords = R_inv @ cam_coords + t_world
+                    
+                    # 将3D坐标添加到结果列表
+                    mask_centers_3d.append([
+                        float(world_coords[0]),  # world_x
+                        float(world_coords[1]),  # world_y
+                        float(world_coords[2])   # world_z
+                    ])
+            
+            logger.info(f"CalculateMaskCentersSimple3D: 处理了 {len(mask_centers_3d)} 个mask")
+            return (json.dumps(mask_centers_3d, ensure_ascii=False),)
+        
+        except Exception as e:
+            error_msg = f"Mask 3D坐标计算错误: {str(e)}"
+            logger.error(error_msg)
+            return (json.dumps({"error": error_msg}, ensure_ascii=False),)
+
 # -----------------------------------------------------------------------------
 # 节点注册
 # -----------------------------------------------------------------------------
@@ -688,11 +818,13 @@ class VGGTSingleImageCameraNode:
 NODE_CLASS_MAPPINGS = {
     "VGGTVideoCameraNode": VGGTVideoCameraNode,
     "VGGTSingleImageCameraNode": VGGTSingleImageCameraNode,
+    "CalculateMaskCentersSimple3D": CalculateMaskCentersSimple3D,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VGGTVideoCameraNode": "VVL VGGT Video Camera Estimator",
     "VGGTSingleImageCameraNode": "VVL VGGT Single Image Camera Estimator",
+    "CalculateMaskCentersSimple3D": "VVL Mask Centers 3D Calculator",
 }
 
 # 如果模型加载器可用，添加到映射中
