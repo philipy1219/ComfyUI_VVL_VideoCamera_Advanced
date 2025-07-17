@@ -856,8 +856,8 @@ class VGGTToBlenderCameraNode:
     
     CATEGORY = "💃VVL/VGGT"
     FUNCTION = "convert_to_blender"
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("blender_camera_data", "position_xyz", "rotation_euler", "focal_length_info")
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("blender_camera_data",)
     
     def _rotation_matrix_to_euler(self, R):
         """将旋转矩阵转换为欧拉角（ZYX顺序）"""
@@ -989,49 +989,17 @@ class VGGTToBlenderCameraNode:
                 }
             }
             
-            # 生成位置信息
-            position_info = {
-                "x": float(converted_position[0]),
-                "y": float(converted_position[1]),
-                "z": float(converted_position[2]),
-                "coordinate_system": coordinate_system
-            }
-            
-            # 生成旋转信息
-            rotation_info = {
-                "x_radians": float(euler_angles[0]),
-                "y_radians": float(euler_angles[1]),
-                "z_radians": float(euler_angles[2]),
-                "x_degrees": float(euler_degrees[0]),
-                "y_degrees": float(euler_degrees[1]),
-                "z_degrees": float(euler_degrees[2]),
-                "rotation_order": "ZYX"
-            }
-            
-            # 生成焦距信息
-            focal_info = {
-                "focal_length_mm": float(focal_length_mm),
-                "focal_length_pixels": float(fx),
-                "sensor_width_mm": float(sensor_width),
-                "image_width_pixels": image_width,
-                "field_of_view_degrees": float(2 * math.degrees(math.atan(image_width / (2 * fx)))),
-                "aspect_ratio": float(fx / fy)
-            }
-            
             logger.info(f"VGGTToBlenderCameraNode: 成功转换view_id={view_id}的相机参数")
             
             return (
-                json.dumps(blender_camera_data, ensure_ascii=False, indent=2),
-                json.dumps(position_info, ensure_ascii=False, indent=2),
-                json.dumps(rotation_info, ensure_ascii=False, indent=2),
-                json.dumps(focal_info, ensure_ascii=False, indent=2)
+                json.dumps(blender_camera_data, ensure_ascii=False, indent=2)
             )
             
         except Exception as e:
             error_msg = f"VGGT到Blender转换错误: {str(e)}"
             logger.error(error_msg)
             error_json = json.dumps({"error": error_msg}, ensure_ascii=False, indent=2)
-            return (error_json, error_json, error_json, error_json)
+            return (error_json,)
 
 # -----------------------------------------------------------------------------
 # 节点注册
