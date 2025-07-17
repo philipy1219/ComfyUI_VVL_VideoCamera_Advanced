@@ -7,6 +7,7 @@ import json
 import tempfile
 from typing import List, Any, Dict
 import logging
+import math
 
 import cv2
 import numpy as np
@@ -811,6 +812,227 @@ class CalculateMaskCentersSimple3D:
             logger.error(error_msg)
             return (json.dumps({"error": error_msg}, ensure_ascii=False),)
 
+class VGGTToBlenderCameraNode:
+    """将VGGT相机参数转换为Blender可用格式的节点"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "intrinsics_json": ("STRING", {
+                    "tooltip": "来自VGGT节点的相机内参JSON数据"
+                }),
+                "poses_json": ("STRING", {
+                    "tooltip": "来自VGGT节点的相机外参JSON数据"
+                }),
+                "view_id": ("INT", {
+                    "default": 0, "min": 0, "max": 100,
+                    "tooltip": "选择要转换的视角ID"
+                }),
+                "image_width": ("INT", {
+                    "default": 1920, "min": 1, "max": 8192,
+                    "tooltip": "原始图像的宽度（像素）"
+                }),
+                "image_height": ("INT", {
+                    "default": 1080, "min": 1, "max": 8192,
+                    "tooltip": "原始图像的高度（像素）"
+                }),
+                "sensor_width": ("FLOAT", {
+                    "default": 36.0, "min": 1.0, "max": 100.0,
+                    "tooltip": "传感器宽度（毫米），全画幅为36mm"
+                }),
+            },
+            "optional": {
+                "coordinate_system": (["OpenCV", "Blender"], {
+                    "default": "Blender",
+                    "tooltip": "输出坐标系类型"
+                }),
+                "scale_factor": ("FLOAT", {
+                    "default": 1.0, "min": 0.001, "max": 1000.0,
+                    "tooltip": "坐标缩放因子"
+                }),
+            }
+        }
+    
+    CATEGORY = "💃VVL/VGGT"
+    FUNCTION = "convert_to_blender"
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("blender_camera_data", "position_xyz", "rotation_euler", "focal_length_info")
+    
+    def _rotation_matrix_to_euler(self, R):
+        """将旋转矩阵转换为欧拉角（ZYX顺序）"""
+        # 提取欧拉角（ZYX顺序，对应Blender的默认旋转顺序）
+        sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+        
+        singular = sy < 1e-6
+        
+        if not singular:
+            x = math.atan2(R[2, 1], R[2, 2])
+            y = math.atan2(-R[2, 0], sy)
+            z = math.atan2(R[1, 0], R[0, 0])
+        else:
+            x = math.atan2(-R[1, 2], R[1, 1])
+            y = math.atan2(-R[2, 0], sy)
+            z = 0
+        
+        return [x, y, z]  # 弧度制
+    
+    def _convert_coordinate_system(self, position, rotation_matrix, coord_system):
+        """转换坐标系"""
+        if coord_system == "Blender":
+            # OpenCV到Blender的坐标系转换
+            # OpenCV: +X右, +Y下, +Z前
+            # Blender: +X右, +Y前, +Z上
+            
+            # 坐标系转换矩阵
+            coord_transform = np.array([
+                [1,  0,  0],
+                [0,  0,  1],
+                [0, -1,  0]
+            ])
+            
+            # 转换位置
+            new_position = coord_transform @ position
+            
+            # 转换旋转矩阵
+            new_rotation = coord_transform @ rotation_matrix @ coord_transform.T
+            
+            return new_position, new_rotation
+        else:
+            # 保持OpenCV坐标系
+            return position, rotation_matrix
+    
+    def convert_to_blender(self, intrinsics_json, poses_json, view_id, 
+                          image_width, image_height, sensor_width, 
+                          coordinate_system="Blender", scale_factor=1.0):
+        """转换VGGT相机参数为Blender格式"""
+        try:
+            # 解析JSON数据
+            intrinsics_data = json.loads(intrinsics_json)
+            poses_data = json.loads(poses_json)
+            
+            # 查找指定视角的数据
+            intrinsic_matrix = None
+            extrinsic_matrix = None
+            camera_position = None
+            
+            for camera in intrinsics_data["cameras"]:
+                if camera["view_id"] == view_id:
+                    intrinsic_matrix = np.array(camera["intrinsic_matrix"])
+                    break
+            
+            for pose in poses_data["poses"]:
+                if pose["view_id"] == view_id:
+                    extrinsic_matrix = np.array(pose["extrinsic_matrix"])
+                    camera_position = np.array(pose["position"])
+                    break
+            
+            if intrinsic_matrix is None or extrinsic_matrix is None:
+                raise ValueError(f"找不到view_id={view_id}的相机数据")
+            
+            # 提取相机参数
+            fx = intrinsic_matrix[0, 0]
+            fy = intrinsic_matrix[1, 1]
+            cx = intrinsic_matrix[0, 2]
+            cy = intrinsic_matrix[1, 2]
+            
+            # 提取旋转矩阵
+            R = extrinsic_matrix[:3, :3]
+            
+            # 计算焦距（毫米）
+            focal_length_mm = fx * sensor_width / image_width
+            
+            # 应用缩放因子
+            camera_position = camera_position * scale_factor
+            
+            # 坐标系转换
+            converted_position, converted_rotation = self._convert_coordinate_system(
+                camera_position, R, coordinate_system
+            )
+            
+            # 转换为欧拉角
+            euler_angles = self._rotation_matrix_to_euler(converted_rotation)
+            euler_degrees = [math.degrees(angle) for angle in euler_angles]
+            
+            # 生成Blender相机数据
+            blender_camera_data = {
+                "view_id": view_id,
+                "coordinate_system": coordinate_system,
+                "camera_settings": {
+                    "location": {
+                        "x": float(converted_position[0]),
+                        "y": float(converted_position[1]),
+                        "z": float(converted_position[2])
+                    },
+                    "rotation_euler": {
+                        "x": float(euler_angles[0]),  # 弧度
+                        "y": float(euler_angles[1]),
+                        "z": float(euler_angles[2])
+                    },
+                    "rotation_degrees": {
+                        "x": float(euler_degrees[0]),  # 度数
+                        "y": float(euler_degrees[1]),
+                        "z": float(euler_degrees[2])
+                    },
+                    "lens": float(focal_length_mm),
+                    "sensor_width": float(sensor_width),
+                    "sensor_fit": "HORIZONTAL"
+                },
+                "original_parameters": {
+                    "fx": float(fx),
+                    "fy": float(fy),
+                    "cx": float(cx),
+                    "cy": float(cy),
+                    "image_width": image_width,
+                    "image_height": image_height,
+                    "scale_factor": scale_factor
+                }
+            }
+            
+            # 生成位置信息
+            position_info = {
+                "x": float(converted_position[0]),
+                "y": float(converted_position[1]),
+                "z": float(converted_position[2]),
+                "coordinate_system": coordinate_system
+            }
+            
+            # 生成旋转信息
+            rotation_info = {
+                "x_radians": float(euler_angles[0]),
+                "y_radians": float(euler_angles[1]),
+                "z_radians": float(euler_angles[2]),
+                "x_degrees": float(euler_degrees[0]),
+                "y_degrees": float(euler_degrees[1]),
+                "z_degrees": float(euler_degrees[2]),
+                "rotation_order": "ZYX"
+            }
+            
+            # 生成焦距信息
+            focal_info = {
+                "focal_length_mm": float(focal_length_mm),
+                "focal_length_pixels": float(fx),
+                "sensor_width_mm": float(sensor_width),
+                "image_width_pixels": image_width,
+                "field_of_view_degrees": float(2 * math.degrees(math.atan(image_width / (2 * fx)))),
+                "aspect_ratio": float(fx / fy)
+            }
+            
+            logger.info(f"VGGTToBlenderCameraNode: 成功转换view_id={view_id}的相机参数")
+            
+            return (
+                json.dumps(blender_camera_data, ensure_ascii=False, indent=2),
+                json.dumps(position_info, ensure_ascii=False, indent=2),
+                json.dumps(rotation_info, ensure_ascii=False, indent=2),
+                json.dumps(focal_info, ensure_ascii=False, indent=2)
+            )
+            
+        except Exception as e:
+            error_msg = f"VGGT到Blender转换错误: {str(e)}"
+            logger.error(error_msg)
+            error_json = json.dumps({"error": error_msg}, ensure_ascii=False, indent=2)
+            return (error_json, error_json, error_json, error_json)
+
 # -----------------------------------------------------------------------------
 # 节点注册
 # -----------------------------------------------------------------------------
@@ -819,12 +1041,14 @@ NODE_CLASS_MAPPINGS = {
     "VGGTVideoCameraNode": VGGTVideoCameraNode,
     "VGGTSingleImageCameraNode": VGGTSingleImageCameraNode,
     "CalculateMaskCentersSimple3D": CalculateMaskCentersSimple3D,
+    "VGGTToBlenderCameraNode": VGGTToBlenderCameraNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VGGTVideoCameraNode": "VVL VGGT Video Camera Estimator",
     "VGGTSingleImageCameraNode": "VVL VGGT Single Image Camera Estimator",
     "CalculateMaskCentersSimple3D": "VVL Mask Centers 3D Calculator",
+    "VGGTToBlenderCameraNode": "VVL VGGT to Blender Camera Converter"
 }
 
 # 如果模型加载器可用，添加到映射中
