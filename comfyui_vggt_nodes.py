@@ -992,13 +992,13 @@ class VGGTToBlenderCameraNode:
             logger.info(f"VGGTToBlenderCameraNode: 成功转换view_id={view_id}的相机参数")
             
             return (
-                json.dumps(blender_camera_data, ensure_ascii=False, indent=2)
+                json.dumps(blender_camera_data, ensure_ascii=False),
             )
             
         except Exception as e:
             error_msg = f"VGGT到Blender转换错误: {str(e)}"
             logger.error(error_msg)
-            error_json = json.dumps({"error": error_msg}, ensure_ascii=False, indent=2)
+            error_json = json.dumps({"error": error_msg}, ensure_ascii=False)
             return (error_json,)
 
 # -----------------------------------------------------------------------------
